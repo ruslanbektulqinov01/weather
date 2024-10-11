@@ -10,15 +10,15 @@ from aiogram.enums import ChatAction, ParseMode
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, select, update
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from get_emoji import get_weather_emoji
 from regions import UZBEKISTAN_REGIONS
 import pytz
-import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,6 +44,7 @@ class UserState:
 user_state = UserState()
 
 
+# Update the WeatherLog model to include notification settings
 class WeatherLog(Base):
     __tablename__ = 'weather_logs'
 
@@ -53,6 +54,8 @@ class WeatherLog(Base):
     temperature = Column(Float, nullable=False)
     weather_desc = Column(String, nullable=False)
     request_time = Column(DateTime, default=datetime.utcnow)
+    notifications_enabled = Column(Boolean, default=False)
+    notification_time = Column(Integer)
 
 
 class DatabaseManager:
@@ -62,17 +65,118 @@ class DatabaseManager:
             await conn.run_sync(Base.metadata.create_all)
 
     @staticmethod
-    async def save_weather_log(user_id: int, location: str, temperature: float, weather_desc: str):
+    async def log_weather_request(user_id: int, location: str, temperature: float, weather_desc: str):
         async with async_session() as session:
             async with session.begin():
-                weather_log = WeatherLog(
+                log = WeatherLog(
                     user_id=user_id,
                     location=location,
                     temperature=temperature,
                     weather_desc=weather_desc
                 )
-                session.add(weather_log)
-            await session.commit()
+                session.add(log)
+
+    @staticmethod
+    async def toggle_notifications(user_id: int):
+        async with async_session() as session:
+            async with session.begin():
+                stmt = select(WeatherLog).where(WeatherLog.user_id == user_id).order_by(WeatherLog.request_time.desc())
+                result = await session.execute(stmt)
+                weather_log = result.scalars().first()
+
+                if weather_log:
+                    new_state = not weather_log.notifications_enabled
+                    await session.execute(
+                        update(WeatherLog)
+                        .where(WeatherLog.user_id == user_id)
+                        .values(notifications_enabled=new_state)
+                    )
+                    return new_state
+                return False
+
+    @staticmethod
+    async def get_notification_status(user_id: int):
+        async with async_session() as session:
+            # Get the most recent log entry for the user
+            subquery = (
+                select(WeatherLog.id)
+                .where(WeatherLog.user_id == user_id)
+                .order_by(WeatherLog.request_time.desc())
+                .limit(1)
+                .scalar_subquery()
+            )
+
+            stmt = (
+                select(WeatherLog.notifications_enabled)
+                .where(WeatherLog.id == subquery)
+            )
+
+            result = await session.execute(stmt)
+            status = result.scalar_one_or_none()
+            return status if status is not None else False
+
+
+    @staticmethod
+    async def get_users_for_notifications():
+        async with async_session() as session:
+            stmt = (
+                select(WeatherLog.user_id, WeatherLog.location)
+                .where(WeatherLog.notifications_enabled == True)
+                .group_by(WeatherLog.user_id, WeatherLog.location)
+                .order_by(WeatherLog.request_time.desc())
+            )
+            result = await session.execute(stmt)
+            return result.fetchall()
+
+    @staticmethod
+    async def set_notification_time(user_id: int, hour: int):
+        async with async_session() as session:
+            async with session.begin():
+                stmt = select(WeatherLog).where(WeatherLog.user_id == user_id).order_by(WeatherLog.request_time.desc())
+                result = await session.execute(stmt)
+                weather_log = result.scalars().first()
+
+                if weather_log:
+                    await session.execute(
+                        update(WeatherLog)
+                        .where(WeatherLog.user_id == user_id)
+                        .values(notifications_enabled=True, notification_time=hour)
+                    )
+                    return True
+                return False
+
+    @staticmethod
+    async def get_notification_time(user_id: int):
+        async with async_session() as session:
+            subquery = (
+                select(WeatherLog.id)
+                .where(WeatherLog.user_id == user_id)
+                .order_by(WeatherLog.request_time.desc())
+                .limit(1)
+                .scalar_subquery()
+            )
+
+            stmt = (
+                select(WeatherLog.notification_time)
+                .where(WeatherLog.id == subquery)
+            )
+
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
+
+def get_time_selection_keyboard():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"{i:02d}:00", callback_data=f"notif_time:{i}")
+            for i in range(j, j+4)
+        ]
+        for j in range(0, 24, 4)
+    ])
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text="❌ Bekor qilish", callback_data="notif_time:cancel")
+    ])
+    return keyboard
 
 
 class WeatherService:
@@ -126,18 +230,104 @@ def get_districts_keyboard(region: str):
     return builder.as_markup(resize_keyboard=True)
 
 
-def get_main_keyboard():
+# Update get_main_keyboard function
+def get_main_keyboard(notifications_enabled: bool = False):
     builder = ReplyKeyboardBuilder()
     builder.row(
         KeyboardButton(text="🏠 Viloyatlar"),
         KeyboardButton(text="🌤 Ob-havo tekshirish")
-    )  # Viloyatlar va Ob-havo tekshirish yuqorida
-    builder.row(KeyboardButton(text="📅 Vaqt tanlash"))  # Vaqt tanlash o'rtada
+    )
+    builder.row(KeyboardButton(text="📅 Vaqt tanlash"))
     builder.row(
-        KeyboardButton(text="📞 Aloqa"),
-        KeyboardButton(text="ℹ️ Yordam")
-    )  # Aloqa va Yordam pastda
+        KeyboardButton(text=f"🔔 Bildirishnomalar {'✅' if notifications_enabled else '❌'}"),
+        KeyboardButton(text="📞 Aloqa")
+    )
+    builder.row(KeyboardButton(text="ℹ️ Yordam"))
     return builder.as_markup(resize_keyboard=True)
+
+
+# Add notification toggle handler
+
+@dp.message(F.text.startswith("🔔 Bildirishnomalar"))
+async def toggle_notifications(message: types.Message):
+    user_id = message.from_user.id
+    current_status = await DatabaseManager.get_notification_status(user_id)
+
+    if current_status:
+        # Turn off notifications
+        await DatabaseManager.toggle_notifications(user_id)
+        await message.answer(
+            "Kunlik ob-havo bildirishnomalari o'chirildi ❌",
+            reply_markup=get_main_keyboard(False)
+        )
+    else:
+        # Show time selection keyboard
+        await message.answer(
+            "Kunlik ob-havo ma'lumotlarini qaysi vaqtda olishni istaysiz?",
+            reply_markup=get_time_selection_keyboard()
+        )
+
+
+@dp.callback_query(F.data.startswith("notif_time:"))
+async def handle_notification_time(callback: types.CallbackQuery):
+    hour = callback.data.split(":")[1]
+
+    if hour == "cancel":
+        await callback.message.edit_text(
+            "Bildirishnomalar yoqilmadi.",
+            reply_markup=None
+        )
+        return
+
+    hour = int(hour)
+    user_id = callback.from_user.id
+
+    success = await DatabaseManager.set_notification_time(user_id, hour)
+
+    if success:
+        await callback.message.edit_text(
+            f"Kunlik ob-havo bildirishnomalari {hour:02d}:00 ga sozlandi ✅"
+        )
+        await callback.message.answer(
+            "Asosiy menyu:",
+            reply_markup=get_main_keyboard(True)
+        )
+    else:
+        await callback.message.edit_text(
+            "Xatolik yuz berdi. Iltimos, avval viloyat va tumanni tanlang.",
+            reply_markup=None
+        )
+
+
+
+# Update the send_daily_notifications function
+async def send_daily_notifications():
+    current_hour = datetime.now(pytz.timezone('Asia/Tashkent')).hour
+    async with async_session() as session:
+        # Get all users who have notifications enabled for the current hour
+        stmt = (
+            select(WeatherLog.user_id, WeatherLog.location)
+            .where(
+                WeatherLog.notifications_enabled == True,
+                WeatherLog.notification_time == current_hour
+            )
+            .group_by(WeatherLog.user_id, WeatherLog.location)
+        )
+        result = await session.execute(stmt)
+        users = result.fetchall()
+
+    for user_id, location in users:
+        try:
+            message = types.Message(chat=types.Chat(id=user_id, type='private'))
+            await send_current_weather(message, location)
+        except Exception as e:
+            logger.error(f"Error sending notification to user {user_id}: {e}")
+
+def setup_scheduler():
+    scheduler = AsyncIOScheduler(timezone="Asia/Tashkent")
+    scheduler.add_job(send_daily_notifications, 'cron', minute=0)  # Run every hour at :00
+    scheduler.start()
+    return scheduler
 
 
 @dp.message(F.text == "🌤 Ob-havo tekshirish")
@@ -214,12 +404,13 @@ async def show_districts(message: types.Message):
     await message.answer(f"{region} tumanlari:", reply_markup=get_districts_keyboard(region))
 
 
+# Update handle_district_selection to check notification status
+
 @dp.message(F.text.startswith("🏘 "))
 async def handle_district_selection(message: types.Message):
     district = message.text.replace("🏘 ", "")
     user_id = message.from_user.id
 
-    # Verify that the selected district is valid
     is_valid_district = any(
         district in districts
         for districts in UZBEKISTAN_REGIONS.values()
@@ -227,15 +418,15 @@ async def handle_district_selection(message: types.Message):
 
     if is_valid_district:
         user_state.locations[user_id] = district
+        notifications_enabled = await DatabaseManager.get_notification_status(user_id)
+
         await message.answer(
             f"Sizning tanlovingiz: <b>{district}</b>\n\n",
             parse_mode=ParseMode.HTML,
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(notifications_enabled)
         )
 
-        # Hozirgi ob-havo ma'lumotlarini ko'rsatish
         await send_current_weather(message, district)
-
     else:
         await message.answer(
             "Iltimos, ob-havo ma'lumotlarini olish uchun ro'yxatdan tumanlardan birini tanlang.",
@@ -245,11 +436,17 @@ async def handle_district_selection(message: types.Message):
 
 @dp.message(F.text == "🔙 Orqaga")
 async def go_back(message: types.Message):
-    await message.answer("Asosiy menyu:", reply_markup=get_main_keyboard())
+    user_id = message.from_user.id
+    notifications_enabled = await DatabaseManager.get_notification_status(user_id)
+    await message.answer("Asosiy menyu:", reply_markup=get_main_keyboard(notifications_enabled))
 
 
+# Update handlers to use the new get_main_keyboard function
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
+    user_id = message.from_user.id
+    notifications_enabled = await DatabaseManager.get_notification_status(user_id)
+
     await message.answer(
         f"Assalomu alaykum, {message.from_user.first_name}! 🌤️\n"
         "Men ob-havo ma'lumotlarini beruvchi botman.\n"
@@ -257,7 +454,7 @@ async def start_command(message: types.Message):
         "1. 🏠 Viloyatlar - Viloyat va tumanini tanlash\n"
         "2. 🌤 Ob-havo tekshirish - Tanlangan hudud uchun ob-havo\n"
         "3. 📅 Vaqt tanlash - Turli vaqt uchun ob-havo",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(notifications_enabled)
     )
 
 
@@ -276,6 +473,8 @@ async def help_command(message: types.Message):
 
 @dp.message(F.text == "📞 Aloqa")
 async def contact_handler(message: types.Message):
+    user_id = message.from_user.id
+    notifications_enabled = await DatabaseManager.get_notification_status(user_id)
     await message.answer(
         "😊 Assalomu alaykum! 🤖 Men bilan bog'lanishni xohlaysizmi?\n"
         "👏 Ajoyib! Fikr-mulohazalaringiz, takliflaringiz yoki savollar bilan bemalol murojaat qiling!\n"
@@ -285,7 +484,7 @@ async def contact_handler(message: types.Message):
         "💡 Eslatma: Agar bot sizga yoqqan bo'lsa, uni do'stlaringizga ham ulashing! 😉\n"
         "🔗 Doimiy ob-havo ma'lumotlari uchun quyidagi ko'k yozuv ustiga bosing:\n"
         "👉 <a href='https://t.me/weather_ob_havobot'>Ob-havo</a>",
-        reply_markup=get_main_keyboard()  # Asosiy klaviaturaga qaytish
+        reply_markup=get_main_keyboard(notifications_enabled)
     )
 
 
@@ -312,11 +511,12 @@ async def weather_command(message: types.Message):
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
-    # Instead of processing any text as a location, we'll guide users to use buttons
+    user_id = message.from_user.id
+    notifications_enabled = await DatabaseManager.get_notification_status(user_id)
     if message.text not in ["🌤 Ob-havo tekshirish", "📅 Vaqt tanlash", "ℹ️ Yordam", "🏠 Viloyatlar", "🔙 Orqaga"]:
         await message.answer(
             "Iltimos, ob-havo ma'lumotlarini olish uchun quyidagi tugmalardan foydalaning:",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(notifications_enabled)
         )
 
 
@@ -338,7 +538,8 @@ async def main():
     logger.info("Bot ishga tushirilmoqda...")
     try:
         await DatabaseManager.init_db()
-        logger.info("Bot ishga tushdi...")
+        scheduler = setup_scheduler()
+        logger.info("Bot va scheduler ishga tushdi...")
         await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Xatolik yuz berdi: {e}")
@@ -351,6 +552,13 @@ async def send_current_weather(message: types.Message, location: str):
         weather_data = await WeatherService.fetch_weather(location)
         if weather_data and 'current' in weather_data:
             current = weather_data['current']
+            # Log the weather request
+            await DatabaseManager.log_weather_request(
+                user_id=message.from_user.id,
+                location=location,
+                temperature=current['temp_c'],
+                weather_desc=current['condition']['text']
+            )
 
             # Get forecast data separately to handle potential missing data
             forecast_data = await WeatherService.fetch_weather(location, 'weekly')
