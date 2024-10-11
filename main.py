@@ -18,12 +18,16 @@ from sqlalchemy.orm import sessionmaker
 from get_emoji import get_weather_emoji
 from regions import UZBEKISTAN_REGIONS
 import pytz
+import os
+from dotenv import load_dotenv
 
-from config import BOT_TOKEN, DATABASE_URL, WEATHER_API_KEY
+load_dotenv()
 
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+WEATHER_API_KEY = os.getenv('WEATHER_API_KEY')
+DATABASE_URL = os.getenv('DATABASE_URL')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 Base = declarative_base()
 engine = create_async_engine(DATABASE_URL, echo=True)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
