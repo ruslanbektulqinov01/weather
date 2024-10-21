@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 Base = declarative_base()
 engine = create_async_engine(DATABASE_URL, echo=True)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -106,6 +105,7 @@ class DatabaseManager:
                 .scalar_subquery()
             )
 
+
             stmt = (
                 select(WeatherLog.notifications_enabled)
                 .where(WeatherLog.id == subquery)
@@ -114,7 +114,6 @@ class DatabaseManager:
             result = await session.execute(stmt)
             status = result.scalar_one_or_none()
             return status if status is not None else False
-
 
     @staticmethod
     async def get_users_for_notifications():
@@ -169,7 +168,7 @@ def get_time_selection_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=f"{i:02d}:00", callback_data=f"notif_time:{i}")
-            for i in range(j, j+4)
+            for i in range(j, j + 4)
         ]
         for j in range(0, 24, 4)
     ])
@@ -299,7 +298,6 @@ async def handle_notification_time(callback: types.CallbackQuery):
         )
 
 
-
 # Update the send_daily_notifications function
 async def send_daily_notifications():
     current_hour = datetime.now(pytz.timezone('Asia/Tashkent')).hour
@@ -322,6 +320,7 @@ async def send_daily_notifications():
             await send_current_weather(message, location)
         except Exception as e:
             logger.error(f"Error sending notification to user {user_id}: {e}")
+
 
 def setup_scheduler():
     scheduler = AsyncIOScheduler(timezone="Asia/Tashkent")
